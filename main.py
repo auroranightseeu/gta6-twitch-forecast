@@ -38,6 +38,10 @@ def empirical_quantile(values, level):
 
 
 def _solve_3x3(a, b):
+    if not all(math.isfinite(value) for row in a for value in row):
+        return None
+    if not all(math.isfinite(value) for value in b):
+        return None
     matrix = [list(a[row]) + [b[row]] for row in range(3)]
 
     for column in range(3):
@@ -99,7 +103,7 @@ def forecast_case(case):
             continue
 
         first_viewers = float(hourly[release_index]["viewers"])
-        if first_viewers <= 1:
+        if not math.isfinite(first_viewers) or first_viewers <= 1:
             continue
 
         first_log = math.log(first_viewers)
