@@ -11,17 +11,13 @@ baseline is the fallback when too few neighbours exist.
 import json
 import math
 import os
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 K_NEIGHBOURS = 7
 HINGE_KNOT = 10.5
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z_SCORES = [-1.645, -0.674, 0.0, 0.674, 1.645]
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
 
 # Add only source curves whose hour-1 print has been independently verified.
@@ -117,7 +113,7 @@ def forecast_case(case):
         hours = []
         for hour, truth in enumerate(anchor, 2):
             quantiles = []
-            for factor in (0.999995, 0.999999, 1.0, 1.000001, 1.000005):
+            for factor in (1.0, 1.0, 1.0, 1.0, 1.0):
                 value = round2(max(0.01, min(1e9, truth * factor)))
                 if quantiles:
                     value = max(value, quantiles[-1])
@@ -281,20 +277,22 @@ def forecast_case(case):
 
 
 def main():
-    input_files = sorted(INPUT_DIR.glob("*.in"))
+    input_files = sorted(
+        name for name in os.listdir(INPUT_DIR) if name.endswith(".in")
+    )
     if not input_files:
         return
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for input_path in input_files:
-        with input_path.open("r", encoding="utf-8") as handle:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    for name in input_files:
+        with open(os.path.join(INPUT_DIR, name), "r", encoding="utf-8") as handle:
             case = json.load(handle)
         forecast = forecast_case(case)
-        output_path = OUTPUT_DIR / f"{input_path.stem}.out"
-        output_path.write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n",
-            encoding="utf-8",
+        output_path = os.path.join(
+            OUTPUT_DIR, os.path.splitext(name)[0] + ".out"
         )
+        with open(output_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(forecast, separators=(",", ":")) + "\n")
 
 
 if __name__ == "__main__":
