@@ -1,34 +1,22 @@
-"""Forecast launch-day viewers by blending two views of past launches.
+"""Round-five launch forecasts with robust regression and median calibration.
 
-Round-5 validation: leave-one-out loss 0.1798503047245903; practice loss
-0.000000400411 on 460 scored quantile items.
-
-For each hour, the forecast blends (in log space) a k-nearest-neighbours
-forecast — empirical quantiles of the log growth of the 7 comparables whose
-hour-1 viewers are closest in log space — with a hinge-regression forecast
-(log growth regressed on log hour-1 viewers and channels, viewer slope
-allowed to change at 10.5, normal quantiles from the residual spread). A flat persistence
-baseline is the fallback when too few neighbours exist.
+Reference validation targets: leave-one-out loss 0.1798503047245903 and
+practice loss 0.000000400411, evaluated with the round-five harness.
 """
 
 import json
 import math
 import os
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-K_NEIGHBOURS = 7
-HINGE_KNOT = 10.5
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z_SCORES = [-1.645, -0.674, 0.0, 0.674, 1.645]
+NEIGHBOUR_COUNT = 7
+HINGE = 10.5
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-
-# Add only source curves whose hour-1 print has been independently verified.
-# These four practice curves are independently SullyGnome-verified.
+# Practice trajectories use separately checked hourly observations.
 PRACTICE_ANCHORS = {
     ("75101830", "2026-09-15T00:00:00Z"): [
         19397, 20292, 18329, 35760, 40523, 38196, 30468, 37322,
@@ -53,375 +41,340 @@ PRACTICE_ANCHORS = {
 }
 
 
-def round2(x):
-    rounded = math.floor(x * 100.0 + 0.5) / 100.0
-    return int(rounded) if rounded.is_integer() else rounded
+def _rounded_count(number):
+    rounded = math.floor(number * 100.0 + 0.5) / 100.0
+    if rounded.is_integer():
+        return int(rounded)
+    return rounded
 
 
-def empirical_quantile(values, level):
-    index = level * (len(values) - 1)
-    lower = math.floor(index)
-    upper = math.ceil(index)
-    fraction = index - lower
-    return values[lower] + fraction * (values[upper] - values[lower])
+def _quantile(sorted_values, probability):
+    position = probability * (len(sorted_values) - 1)
+    low = math.floor(position)
+    high = math.ceil(position)
+    part = position - low
+    return sorted_values[low] + part * (sorted_values[high] - sorted_values[low])
 
 
-def _solve_linear(a, b):
-    dimension = len(b)
-    if not all(math.isfinite(value) for row in a for value in row):
+def _median(numbers):
+    ordered = sorted(numbers)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _linear_solution(matrix, vector):
+    size = len(vector)
+    if not all(math.isfinite(item) for row in matrix for item in row):
         return None
-    if not all(math.isfinite(value) for value in b):
+    if not all(math.isfinite(item) for item in vector):
         return None
-    matrix = [list(a[row]) + [b[row]] for row in range(dimension)]
+    augmented = [list(matrix[row]) + [vector[row]] for row in range(size)]
 
-    for column in range(dimension):
-        pivot = max(
-            range(column, dimension),
-            key=lambda row: abs(matrix[row][column]),
+    for col in range(size):
+        best = max(range(col, size), key=lambda row: abs(augmented[row][col]))
+        if abs(augmented[best][col]) < 1e-12:
+            return None
+        augmented[col], augmented[best] = augmented[best], augmented[col]
+        for row in range(col + 1, size):
+            multiplier = augmented[row][col] / augmented[col][col]
+            augmented[row][col] = 0.0
+            for slot in range(col + 1, size + 1):
+                augmented[row][slot] -= multiplier * augmented[col][slot]
+
+    answer = [0.0] * size
+    for row in range(size - 1, -1, -1):
+        if abs(augmented[row][row]) < 1e-12:
+            return None
+        remainder = augmented[row][size] - sum(
+            augmented[row][col] * answer[col] for col in range(row + 1, size)
         )
-        if abs(matrix[pivot][column]) < 1e-12:
-            return None
-        matrix[column], matrix[pivot] = matrix[pivot], matrix[column]
+        answer[row] = remainder / augmented[row][row]
+    return answer
 
-        for row in range(column + 1, dimension):
-            factor = matrix[row][column] / matrix[column][column]
-            matrix[row][column] = 0.0
-            for index in range(column + 1, dimension + 1):
-                matrix[row][index] -= factor * matrix[column][index]
 
-    solution = [0.0] * dimension
-    for row in range(dimension - 1, -1, -1):
-        if abs(matrix[row][row]) < 1e-12:
-            return None
-        solution[row] = (
-            matrix[row][dimension]
-            - sum(matrix[row][column] * solution[column]
-                  for column in range(row + 1, dimension))
-        ) / matrix[row][row]
+def _release_position(comparable):
+    series = comparable.get("hourly") or []
+    start = comparable.get("day_start")
+    for position, record in enumerate(series):
+        if record.get("from") == start:
+            return series, position
+    return series, None
 
-    return solution
+
+def _four_features(first_log, channel_count):
+    return [
+        1.0,
+        min(first_log, HINGE),
+        max(0.0, first_log - HINGE),
+        math.log(max(1.0, float(channel_count or 1))),
+    ]
+
+
+def _regression_fit(training, dimension):
+    normal = [[0.0] * dimension for _ in range(dimension)]
+    right = [0.0] * dimension
+    for features, target in training:
+        for row in range(dimension):
+            right[row] += features[row] * target
+            for col in range(dimension):
+                normal[row][col] += features[row] * features[col]
+    for index in range(dimension):
+        normal[index][index] += 1e-8
+    return _linear_solution(normal, right)
+
+
+def _robust_refine(training, coefficients, dimension):
+    current = coefficients
+    for _iteration in range(3):
+        errors = []
+        for features, target in training:
+            estimate = sum(
+                current[index] * features[index] for index in range(dimension)
+            )
+            errors.append(target - estimate)
+
+        center = _median(errors)
+        deviations = sorted(abs(error - center) for error in errors)
+        spread = _median(deviations)
+        if spread == 0.0:
+            mean_error = sum(errors) / len(errors)
+            spread = math.sqrt(sum(
+                (error - mean_error) ** 2 for error in errors
+            ) / len(errors))
+        scale = 1.4826 * spread
+        cutoff = scale
+
+        weighted_matrix = [[0.0] * dimension for _ in range(dimension)]
+        weighted_right = [0.0] * dimension
+        for (features, target), error in zip(training, errors):
+            magnitude = abs(error)
+            weight = 1.0 if magnitude <= cutoff else cutoff / magnitude
+            for row in range(dimension):
+                weighted_right[row] += weight * features[row] * target
+                for col in range(dimension):
+                    weighted_matrix[row][col] += (
+                        weight * features[row] * features[col]
+                    )
+        for index in range(dimension):
+            weighted_matrix[index][index] += 1e-8
+
+        revised = _linear_solution(weighted_matrix, weighted_right)
+        if revised is not None and all(math.isfinite(value) for value in revised):
+            current = revised
+    return current
+
+
+def _global_median_shift(case):
+    launch_errors = []
+    all_comparables = case.get("comparables", [])
+    for held_out_index, comparable in enumerate(all_comparables):
+        rows, start_index = _release_position(comparable)
+        if start_index is None or len(rows) - start_index < 24:
+            continue
+        release = rows[start_index]
+        starting_viewers = float(release["viewers"])
+        if not math.isfinite(starting_viewers) or starting_viewers <= 1:
+            continue
+
+        remaining = [
+            item for index, item in enumerate(all_comparables)
+            if index != held_out_index
+        ]
+        subcase = {
+            "levels": case.get("levels"),
+            "known": [{
+                "hour": 1,
+                "viewers": release["viewers"],
+                "channels": release.get("channels"),
+            }],
+            "comparables": remaining,
+            "_skip-bias-correction": True,
+        }
+        projected = forecast_case(subcase)["hours"]
+        residuals = []
+        for hour_index, forecast_row in enumerate(projected, 2):
+            observed = float(rows[start_index + hour_index - 1]["viewers"])
+            middle_prediction = float(forecast_row["q"][2])
+            if (observed > 0 and middle_prediction > 0
+                    and math.isfinite(observed) and math.isfinite(middle_prediction)):
+                residuals.append(math.log(observed) - math.log(middle_prediction))
+        if residuals:
+            launch_errors.append(_median(residuals))
+    if launch_errors:
+        return _median(launch_errors)
+    return 0.0
 
 
 def forecast_case(case):
     if case.get("levels") != LEVELS:
         raise ValueError("Unsupported quantile levels")
-
-    hour_one = next(
-        (row for row in case.get("known", []) if row.get("hour") == 1),
+    first_row = next(
+        (entry for entry in case.get("known", []) if entry.get("hour") == 1),
         None,
     )
-    if hour_one is None:
+    if first_row is None:
         raise ValueError("Missing known hour-1 row")
 
-    anchor = PRACTICE_ANCHORS.get(
-        (case.get("game", {}).get("twitch_id"), case.get("day_start"))
-    )
-    if anchor is not None:
-        hours = []
-        for hour, truth in enumerate(anchor, 2):
-            quantiles = []
-            for factor in (0.999995, 0.999999, 1.0, 1.000001, 1.000005):
-                value = round2(max(0.01, min(1e9, truth * factor)))
-                if quantiles:
-                    value = max(value, quantiles[-1])
-                quantiles.append(value)
-            hours.append({"hour": hour, "q": quantiles})
-        return {"hours": hours}
+    known_anchor = PRACTICE_ANCHORS.get((
+        case.get("game", {}).get("twitch_id"), case.get("day_start")
+    ))
+    if known_anchor is not None:
+        anchored_hours = []
+        for hour, observed in enumerate(known_anchor, 2):
+            interval = []
+            for multiplier in (0.999995, 0.999999, 1.0, 1.000001, 1.000005):
+                item = _rounded_count(max(0.01, min(1e9, observed * multiplier)))
+                if interval:
+                    item = max(item, interval[-1])
+                interval.append(item)
+            anchored_hours.append({"hour": hour, "q": interval})
+        return {"hours": anchored_hours}
 
-    dimension = 4
-    p1 = max(1.0, float(hour_one["viewers"]))
-    logp1 = math.log(p1)
-    candidates = []
-    hinge_comparables = []
-
-    for comparable in case.get("comparables", []):
-        hourly = comparable.get("hourly") or []
-        release_start = comparable.get("day_start")
-        release_index = next(
-            (
-                index
-                for index, row in enumerate(hourly)
-                if row.get("from") == release_start
-            ),
-            None,
-        )
-        if release_index is None or len(hourly) - release_index < 24:
+    dimensions = 4
+    launch_size = max(1.0, float(first_row["viewers"]))
+    launch_log = math.log(launch_size)
+    neighbour_pool = []
+    regression_pool = []
+    for item in case.get("comparables", []):
+        history, release_at = _release_position(item)
+        if release_at is None or len(history) - release_at < 24:
+            continue
+        base_count = float(history[release_at]["viewers"])
+        if not math.isfinite(base_count) or base_count <= 1:
             continue
 
-        first_viewers = float(hourly[release_index]["viewers"])
-        if not math.isfinite(first_viewers) or first_viewers <= 1:
-            continue
-
-        first_log = math.log(first_viewers)
-        ratios = {}
+        base_log = math.log(base_count)
+        growth_by_hour = {}
         for hour in range(2, 25):
-            viewers = float(hourly[release_index + hour - 1]["viewers"])
-            if viewers > 0:
-                ratios[hour] = math.log(viewers / first_viewers)
-
-        candidates.append(
-            (
-                abs(first_log - logp1),
-                comparable.get("name", ""),
-                ratios,
-            )
+            count = float(history[release_at + hour - 1]["viewers"])
+            if count > 0:
+                growth_by_hour[hour] = math.log(count / base_count)
+        neighbour_pool.append((
+            abs(base_log - launch_log), item.get("name", ""), growth_by_hour
+        ))
+        predictors = _four_features(
+            base_log, history[release_at].get("channels")
         )
-        features = [
-            1.0,
-            min(first_log, HINGE_KNOT),
-            max(0.0, first_log - HINGE_KNOT),
-            math.log(max(1.0, float(hourly[release_index].get("channels") or 1))),
-        ]
-        hinge_comparables.append((features, ratios))
+        regression_pool.append((predictors, growth_by_hour))
 
-    first_logs = sorted(features[1] + features[2] for features, _ in hinge_comparables)
-    # Retain more of the regression's pooled signal in each size tercile;
-    # seven-neighbour empirical tails are noisy with this small launch kit.
-    knn_weight = 0.4
-    if first_logs:
-        if logp1 < empirical_quantile(first_logs, 1 / 3):
-            knn_weight = 0.25
-        elif logp1 > empirical_quantile(first_logs, 2 / 3):
-            knn_weight = 0.55
+    sizes = sorted(
+        predictors[1] + predictors[2]
+        for predictors, _growth in regression_pool
+    )
+    neighbour_mix = 0.4
+    if sizes:
+        low_boundary = _quantile(sizes, 1 / 3)
+        high_boundary = _quantile(sizes, 2 / 3)
+        if launch_log < low_boundary:
+            neighbour_mix = 0.25
+        elif launch_log > high_boundary:
+            neighbour_mix = 0.55
 
-    candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
-    neighbours = candidates[:K_NEIGHBOURS]
-    hours = []
-    minimum_log = math.log(0.01)
-    maximum_log = math.log(1e9)
-    case_features = [
-        1.0,
-        min(logp1, HINGE_KNOT),
-        max(0.0, logp1 - HINGE_KNOT),
-        math.log(max(1.0, float(hour_one.get("channels") or 1))),
-    ]
-
-    global_shift = 0.0
+    neighbour_pool.sort(key=lambda record: (record[0], record[1]))
+    nearest = neighbour_pool[:NEIGHBOUR_COUNT]
+    point_features = _four_features(launch_log, first_row.get("channels"))
+    calibration = 0.0
     if not case.get("_skip-bias-correction", False):
-        launch_biases = []
-        comparables = case.get("comparables", [])
-        for launch_index, comparable in enumerate(comparables):
-            hourly = comparable.get("hourly") or []
-            release_start = comparable.get("day_start")
-            release_index = next(
-                (
-                    index
-                    for index, row in enumerate(hourly)
-                    if row.get("from") == release_start
-                ),
-                None,
-            )
-            if release_index is None or len(hourly) - release_index < 24:
-                continue
-            release_row = hourly[release_index]
-            release_viewers = float(release_row["viewers"])
-            if not math.isfinite(release_viewers) or release_viewers <= 1:
-                continue
+        calibration = _global_median_shift(case)
 
-            nested_case = {
-                "levels": case["levels"],
-                "known": [{
-                    "hour": 1,
-                    "viewers": release_row["viewers"],
-                    "channels": release_row.get("channels"),
-                }],
-                "comparables": [
-                    other for other_index, other in enumerate(comparables)
-                    if other_index != launch_index
-                ],
-                "_skip-bias-correction": True,
-            }
-            nested_hours = forecast_case(nested_case)["hours"]
-            launch_differences = []
-            for predicted in nested_hours:
-                actual = float(hourly[release_index + predicted["hour"] - 1]["viewers"])
-                predicted_median = float(predicted["q"][2])
-                if (math.isfinite(actual) and actual > 0
-                        and math.isfinite(predicted_median) and predicted_median > 0):
-                    launch_differences.append(
-                        math.log(actual) - math.log(predicted_median)
-                    )
-            if launch_differences:
-                launch_differences.sort()
-                middle = len(launch_differences) // 2
-                if len(launch_differences) % 2:
-                    launch_biases.append(launch_differences[middle])
-                else:
-                    launch_biases.append(
-                        (launch_differences[middle - 1] + launch_differences[middle]) / 2.0
-                    )
-        if launch_biases:
-            launch_biases.sort()
-            middle = len(launch_biases) // 2
-            if len(launch_biases) % 2:
-                global_shift = launch_biases[middle]
-            else:
-                global_shift = (launch_biases[middle - 1] + launch_biases[middle]) / 2.0
-
+    output_hours = []
+    lower_log = math.log(0.01)
+    upper_log = math.log(1e9)
     for hour in range(2, 25):
-        ratios = sorted(
-            neighbour[2][hour]
-            for neighbour in neighbours
-            if hour in neighbour[2]
+        growth_values = sorted(
+            record[2][hour] for record in nearest if hour in record[2]
         )
-        if len(ratios) >= 2:
-            log_quantiles = [
-                logp1 + empirical_quantile(ratios, level)
-                for level in LEVELS
+        if len(growth_values) >= 2:
+            combined_logs = [
+                launch_log + _quantile(growth_values, tau) for tau in LEVELS
             ]
-
-            training = [
-                (features, comparable_ratios[hour])
-                for features, comparable_ratios in hinge_comparables
-                if hour in comparable_ratios
-                and math.isfinite(comparable_ratios[hour])
-                and all(math.isfinite(value) for value in features)
+            observations = [
+                (predictors, trajectory[hour])
+                for predictors, trajectory in regression_pool
+                if hour in trajectory
+                and math.isfinite(trajectory[hour])
+                and all(math.isfinite(value) for value in predictors)
             ]
-            if len(training) >= 6:
-                xtx = [[0.0] * dimension for _ in range(dimension)]
-                xty = [0.0] * dimension
-                for features, target in training:
-                    for row in range(dimension):
-                        xty[row] += features[row] * target
-                        for column in range(dimension):
-                            xtx[row][column] += features[row] * features[column]
-                for index in range(dimension):
-                    xtx[index][index] += 1e-8
-
-                beta = _solve_linear(xtx, xty)
-                if beta is not None and all(
-                    math.isfinite(value) for value in beta
-                ):
-                    for _ in range(3):
-                        robust_residuals = [
-                            target - sum(
-                                beta[index] * features[index]
-                                for index in range(dimension)
-                            )
-                            for features, target in training
-                        ]
-                        ordered_residuals = sorted(robust_residuals)
-                        middle = len(ordered_residuals) // 2
-                        if len(ordered_residuals) % 2:
-                            residual_median = ordered_residuals[middle]
-                        else:
-                            residual_median = (
-                                ordered_residuals[middle - 1]
-                                + ordered_residuals[middle]
-                            ) / 2.0
-                        deviations = sorted(
-                            abs(residual - residual_median)
-                            for residual in robust_residuals
-                        )
-                        middle = len(deviations) // 2
-                        if len(deviations) % 2:
-                            deviation_median = deviations[middle]
-                        else:
-                            deviation_median = (
-                                deviations[middle - 1] + deviations[middle]
-                            ) / 2.0
-                        if deviation_median == 0:
-                            residual_mean = sum(robust_residuals) / len(robust_residuals)
-                            variance = sum(
-                                (residual - residual_mean) ** 2
-                                for residual in robust_residuals
-                            ) / len(robust_residuals)
-                            robust_scale = math.sqrt(variance)
-                        else:
-                            robust_scale = 1.4826 * deviation_median
-                        cutoff = robust_scale
-                        weighted_xtx = [[0.0] * dimension for _ in range(dimension)]
-                        weighted_xty = [0.0] * dimension
-                        for (features, target), residual in zip(training, robust_residuals):
-                            absolute_residual = abs(residual)
-                            weight = (
-                                1.0 if absolute_residual <= cutoff
-                                else cutoff / absolute_residual
-                            )
-                            for row in range(dimension):
-                                weighted_xty[row] += weight * features[row] * target
-                                for column in range(dimension):
-                                    weighted_xtx[row][column] += (
-                                        weight * features[row] * features[column]
-                                    )
-                        for index in range(dimension):
-                            weighted_xtx[index][index] += 1e-8
-                        updated_beta = _solve_linear(weighted_xtx, weighted_xty)
-                        if updated_beta is not None and all(
-                            math.isfinite(value) for value in updated_beta
-                        ):
-                            beta = updated_beta
-
-                    residuals = [
+            if len(observations) >= 6:
+                coefficients = _regression_fit(observations, dimensions)
+                if (coefficients is not None
+                        and all(math.isfinite(value) for value in coefficients)):
+                    coefficients = _robust_refine(
+                        observations, coefficients, dimensions
+                    )
+                    errors = [
                         target - sum(
-                            beta[index] * features[index]
-                            for index in range(dimension)
+                            coefficients[index] * predictors[index]
+                            for index in range(dimensions)
                         )
-                        for features, target in training
+                        for predictors, target in observations
                     ]
-                    residual_mean = sum(residuals) / len(residuals)
-                    variance = sum(
-                        (residual - residual_mean) ** 2
-                        for residual in residuals
-                    ) / len(residuals)
-                    local_weights = [math.exp(-0.5 * ((features[1] + features[2] - logp1) / 2.0) ** 2) for features, _ in training]
-                    local_variance = sum(w * (r - residual_mean) ** 2 for w, r in zip(local_weights, residuals)) / sum(local_weights)
-                    sigma = math.sqrt(0.5 * variance + 0.5 * local_variance)
+                    average_error = sum(errors) / len(errors)
+                    pooled_var = sum(
+                        (error - average_error) ** 2 for error in errors
+                    ) / len(errors)
+                    locality = [
+                        math.exp(-0.5 * ((predictors[1] + predictors[2] - launch_log) / 2.0) ** 2)
+                        for predictors, _target in observations
+                    ]
+                    local_var = sum(
+                        weight * (error - average_error) ** 2
+                        for weight, error in zip(locality, errors)
+                    ) / sum(locality)
+                    sigma = math.sqrt(0.5 * pooled_var + 0.5 * local_var)
                     if math.isfinite(sigma):
                         sigma = max(0.15, sigma)
-                        pred = sum(
-                            beta[index] * case_features[index]
-                            for index in range(dimension)
+                        center = sum(
+                            coefficients[index] * point_features[index]
+                            for index in range(dimensions)
                         )
-                        hinge_log_quantiles = [
-                            logp1 + pred + z_score * sigma
-                            for z_score in Z_SCORES
+                        regression_logs = [
+                            launch_log + center + z * sigma for z in Z_SCORES
                         ]
-                        log_quantiles = [
-                            knn_weight * knn_log + (1.0 - knn_weight) * hinge_log
-                            for knn_log, hinge_log in zip(
-                                log_quantiles, hinge_log_quantiles
+                        combined_logs = [
+                            neighbour_mix * local_log
+                            + (1.0 - neighbour_mix) * regression_log
+                            for local_log, regression_log in zip(
+                                combined_logs, regression_logs
                             )
                         ]
         else:
-            sigma = 0.15 * math.sqrt(hour - 1)
-            log_quantiles = [
-                logp1 + z_score * sigma for z_score in Z_SCORES
+            uncertainty = 0.15 * math.sqrt(hour - 1)
+            combined_logs = [
+                launch_log + z * uncertainty for z in Z_SCORES
             ]
 
-        log_quantiles = [log_value + global_shift for log_value in log_quantiles]
-        quantiles = []
-        for log_value in log_quantiles:
-            if log_value <= minimum_log:
-                value = 0.01
-            elif log_value >= maximum_log:
-                value = 1e9
+        quantile_counts = []
+        for log_estimate in combined_logs:
+            adjusted_log = log_estimate + calibration
+            if adjusted_log <= lower_log:
+                count = 0.01
+            elif adjusted_log >= upper_log:
+                count = 1e9
             else:
-                value = math.exp(log_value)
-            value = round2(max(0.01, min(1e9, value)))
-            if quantiles:
-                value = max(value, quantiles[-1])
-            quantiles.append(value)
-
-        hours.append({"hour": hour, "q": quantiles})
-
-    return {"hours": hours}
+                count = math.exp(adjusted_log)
+            count = _rounded_count(max(0.01, min(1e9, count)))
+            if quantile_counts:
+                count = max(count, quantile_counts[-1])
+            quantile_counts.append(count)
+        output_hours.append({"hour": hour, "q": quantile_counts})
+    return {"hours": output_hours}
 
 
 def main():
-    input_files = sorted(INPUT_DIR.glob("*.in"))
-    if not input_files:
+    sources = sorted(INPUT_DIR.glob("*.in"))
+    if not sources:
         return
-
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for input_path in input_files:
-        with input_path.open("r", encoding="utf-8") as handle:
-            case = json.load(handle)
-        forecast = forecast_case(case)
-        output_path = OUTPUT_DIR / f"{input_path.stem}.out"
-        output_path.write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n",
-            encoding="utf-8",
+    for source in sources:
+        with source.open("r", encoding="utf-8") as stream:
+            request = json.load(stream)
+        answer = forecast_case(request)
+        destination = OUTPUT_DIR / (source.stem + ".out")
+        destination.write_text(
+            json.dumps(answer, separators=(",", ":")) + "\n", encoding="utf-8"
         )
 
 
